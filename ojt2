@@ -1,0 +1,107 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.providers.teradata.hooks.teradata import TeradataHook
+from datetime import timedelta, datetime
+import pendulum
+
+kst = pendulum.timezone("Asia/Seoul")
+
+default_args = {
+    "owner": "eunjung",
+    "start_date": datetime(2024, 7, 22, tzinfo=kst),
+    "email_on_failure": False,
+    "email_on_retry": False,
+    "retries": 3,
+    "retry_delay": timedelta(minutes=3),
+}
+
+dag = DAG(
+    dag_id="ojt5",
+    description="Move data from PostgreSQL to Teradata and delete from PostgreSQL",
+    schedule_interval="05 08 * * *",
+    catchup=False,
+    default_args=default_args
+)
+
+def transfer_data():
+    pg_hook = PostgresHook(postgres_conn_id="postgresql_public")
+    td_hook = TeradataHook(teradata_conn_id="teradata_conn")
+    
+    # PostgreSQL에서 데이터 가져오기
+    pg_conn = pg_hook.get_conn()
+    pg_cursor = pg_conn.cursor()
+    pg_cursor.execute("SELECT id, title, href, datetime, content, press, journalist FROM articles")
+    rows = pg_cursor.fetchall()
+    
+    # Teradata에 데이터 삽입하기
+    td_conn = td_hook.get_conn()
+    td_cursor = td_conn.cursor()
+    
+    # 세션의 문자 집합 설정
+    td_cursor.execute("SET SESSION CHARSET 'UNICODE';")
+
+    insert_query = """
+    INSERT INTO QG_DB.articles (id, newstitle, href, datetime, content, press, journalist)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    """
+    
+    # 데이터의 유니코드 변환
+    cleaned_rows = [(col if not isinstance(col, str) else col.encode('utf-8').decode('utf-8') for col in row) for row in rows]
+    
+    try:
+        td_cursor.executemany(insert_query, cleaned_rows)
+        td_conn.commit()
+    except Exception as e:
+        print(f"Error inserting data into Teradata: {e}")
+        td_conn.rollback()
+    finally:
+        pg_conn.close()
+        td_conn.close()
+
+    
+    # 데이터를 삽입하기 전에 문자열의 유니코드 문제가 있는지 확인하고 정리합니다.
+    def clean_string(value):
+        if isinstance(value, str):
+            return value.encode('ascii', 'ignore').decode('ascii')
+        return value
+    
+    cleaned_rows = [(clean_string(col) for col in row) for row in rows]
+    
+    try:
+        for row in cleaned_rows:
+            td_cursor.execute(insert_query, row)
+        td_conn.commit()
+    except Exception as e:
+        print(f"Error inserting data into Teradata: {e}")
+        td_conn.rollback()
+    finally:
+        pg_conn.close()
+        td_conn.close()
+
+def delete_postgres_data():
+    pg_hook = PostgresHook(postgres_conn_id="postgresql_public")
+    pg_conn = pg_hook.get_conn()
+    pg_cursor = pg_conn.cursor()
+    try:
+        pg_cursor.execute("DELETE FROM articles")
+        pg_conn.commit()
+    except Exception as e:
+        print(f"Error deleting data from PostgreSQL: {e}")
+        pg_conn.rollback()
+    finally:
+        pg_conn.close()
+
+transfer_task = PythonOperator(
+    task_id="transfer_task",
+    python_callable=transfer_data,
+    dag=dag,
+)
+
+delete_task = PythonOperator(
+    task_id="delete_task",
+    python_callable=delete_postgres_data,
+    dag=dag,
+)
+
+transfer_task >> delete_task
